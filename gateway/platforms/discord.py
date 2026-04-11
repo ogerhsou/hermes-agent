@@ -2048,6 +2048,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         providers: list,
+        direct_models: Optional[list],
         current_model: str,
         current_provider: str,
         session_key: str,

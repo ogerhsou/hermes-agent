@@ -1080,6 +1080,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         providers: list,
+        direct_models: Optional[list],
         current_model: str,
         current_provider: str,
         session_key: str,
@@ -1101,29 +1102,37 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         try:
-            # Build provider buttons — 2 per row
-            buttons: list = []
-            for p in providers:
-                count = p.get("total_models", len(p.get("models", [])))
-                label = f"{p['name']} ({count})"
-                if p.get("is_current"):
-                    label = f"✓ {label}"
-                # Compact callback data: mp:<slug>  (max 64 bytes)
-                buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
-                )
-
-            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
-            keyboard = InlineKeyboardMarkup(rows)
-
             provider_label = get_label(current_provider)
-            text = (
-                f"⚙ *Model Configuration*\n\n"
-                f"Current model: `{current_model or 'unknown'}`\n"
-                f"Provider: {provider_label}\n\n"
-                f"Select a provider:"
-            )
+            if direct_models:
+                keyboard = self._build_direct_model_keyboard(direct_models)
+                text = (
+                    f"⚙ *Model Configuration*\n\n"
+                    f"Current model: `{current_model or 'unknown'}`\n"
+                    f"Provider: {provider_label}\n\n"
+                    f"Select a model:"
+                )
+            else:
+                # Build provider buttons — 2 per row
+                buttons: list = []
+                for p in providers:
+                    count = p.get("total_models", len(p.get("models", [])))
+                    label = f"{p['name']} ({count})"
+                    if p.get("is_current"):
+                        label = f"✓ {label}"
+                    # Compact callback data: mp:<slug>  (max 64 bytes)
+                    buttons.append(
+                        InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
+                    )
+
+                rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+                rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+                keyboard = InlineKeyboardMarkup(rows)
+                text = (
+                    f"⚙ *Model Configuration*\n\n"
+                    f"Current model: `{current_model or 'unknown'}`\n"
+                    f"Provider: {provider_label}\n\n"
+                    f"Select a provider:"
+                )
 
             thread_id = metadata.get("thread_id") if metadata else None
             msg = await self._bot.send_message(
@@ -1138,6 +1147,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._model_picker_state[str(chat_id)] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
+                "direct_models": direct_models or [],
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
                 "current_model": current_model,
@@ -1150,6 +1160,26 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     _MODEL_PAGE_SIZE = 8
+
+    def _build_direct_model_keyboard(self, direct_models: list) -> InlineKeyboardMarkup:
+        """Build a compact inline keyboard for direct model selections."""
+        buttons: list = []
+        for idx, entry in enumerate(direct_models):
+            label = (
+                entry.get("label")
+                or entry.get("input")
+                or entry.get("model")
+                or f"Model {idx + 1}"
+            )
+            if entry.get("is_current"):
+                label = f"✓ {label}"
+            if len(label) > 38:
+                label = label[:35] + "..."
+            buttons.append(InlineKeyboardButton(label, callback_data=f"ma:{idx}"))
+
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+        return InlineKeyboardMarkup(rows)
 
     def _build_model_keyboard(self, models: list, page: int) -> tuple:
         """Build paginated model buttons. Returns (keyboard, page_info_text)."""
@@ -1195,7 +1225,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle model picker inline keyboard callbacks (mp:/mm:/mb:/mx:/mg:)."""
+        """Handle model picker inline keyboard callbacks (ma:/mp:/mm:/mb:/mx:/mg:)."""
         state = self._model_picker_state.get(chat_id)
         if not state:
             await query.answer(text="Picker expired — use /model again.")
@@ -1207,7 +1237,57 @@ class TelegramAdapter(BasePlatformAdapter):
             def get_label(slug):
                 return slug
 
-        if data.startswith("mp:"):
+        if data.startswith("ma:"):
+            # --- Direct alias selected: switch immediately ---
+            try:
+                idx = int(data[3:])
+            except ValueError:
+                await query.answer(text="Invalid selection.")
+                return
+
+            direct_models = state.get("direct_models", [])
+            if idx < 0 or idx >= len(direct_models):
+                await query.answer(text="Invalid model index.")
+                return
+
+            entry = direct_models[idx]
+            model_input = (
+                entry.get("input")
+                or entry.get("label")
+                or entry.get("model")
+                or ""
+            )
+            callback = state.get("on_model_selected")
+
+            if not callback or not model_input:
+                await query.answer(text="Picker expired.")
+                return
+
+            try:
+                result_text = await callback(chat_id, model_input, "")
+            except Exception as exc:
+                logger.error("Direct model picker switch failed: %s", exc)
+                result_text = f"Error switching model: {exc}"
+
+            try:
+                await query.edit_message_text(
+                    text=result_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                try:
+                    await query.edit_message_text(
+                        text=result_text,
+                        parse_mode=None,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            await query.answer(text="Model switched!")
+            self._model_picker_state.pop(chat_id, None)
+
+        elif data.startswith("mp:"):
             # --- Provider selected: show model buttons (page 0) ---
             provider_slug = data[3:]
             provider = next(
@@ -1327,32 +1407,43 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mb":
             # --- Back to provider list ---
-            buttons = []
-            for p in state["providers"]:
-                count = p.get("total_models", len(p.get("models", [])))
-                label = f"{p['name']} ({count})"
-                if p.get("is_current"):
-                    label = f"✓ {label}"
-                buttons.append(
-                    InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
-                )
-
-            rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
-            keyboard = InlineKeyboardMarkup(rows)
-
             try:
                 provider_label = get_label(state["current_provider"])
             except Exception:
                 provider_label = state["current_provider"]
 
-            await query.edit_message_text(
-                text=(
+            direct_models = state.get("direct_models") or []
+            if direct_models:
+                keyboard = self._build_direct_model_keyboard(direct_models)
+                text = (
+                    f"⚙ *Model Configuration*\n\n"
+                    f"Current model: `{state['current_model'] or 'unknown'}`\n"
+                    f"Provider: {provider_label}\n\n"
+                    f"Select a model:"
+                )
+            else:
+                buttons = []
+                for p in state["providers"]:
+                    count = p.get("total_models", len(p.get("models", [])))
+                    label = f"{p['name']} ({count})"
+                    if p.get("is_current"):
+                        label = f"✓ {label}"
+                    buttons.append(
+                        InlineKeyboardButton(label, callback_data=f"mp:{p['slug']}")
+                    )
+
+                rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+                rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+                keyboard = InlineKeyboardMarkup(rows)
+                text = (
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{state['current_model'] or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
                     f"Select a provider:"
-                ),
+                )
+
+            await query.edit_message_text(
+                text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
             )
@@ -1381,7 +1472,7 @@ class TelegramAdapter(BasePlatformAdapter):
         data = query.data
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mm:", "mb", "mx", "mg:")):
+        if data.startswith(("ma:", "mp:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)

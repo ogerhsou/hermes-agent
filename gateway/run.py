@@ -287,21 +287,27 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(override: dict | None = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
 
+    override_cfg = override if isinstance(override, dict) else {}
+    requested_provider = (
+        str(override_cfg.get("provider") or "").strip()
+        or os.getenv("HERMES_INFERENCE_PROVIDER")
+    )
+
     try:
         runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            requested=requested_provider,
         )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    return {
+    resolved = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -310,6 +316,16 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+    for key in ("api_key", "base_url", "provider", "api_mode", "command", "credential_pool"):
+        value = override_cfg.get(key)
+        if value not in (None, ""):
+            resolved[key] = value
+
+    if override_cfg.get("args") is not None:
+        resolved["args"] = list(override_cfg.get("args") or [])
+
+    return resolved
 
 
 def _build_media_placeholder(event) -> str:
@@ -415,13 +431,18 @@ def _load_gateway_config() -> dict:
     return {}
 
 
-def _resolve_gateway_model(config: dict | None = None) -> str:
+def _resolve_gateway_model(config: dict | None = None, override: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
     Without this, temporary AIAgent instances (memory flush, /compress) fall
     back to the hardcoded default which fails when the active provider is
     openai-codex.
     """
+    override_cfg = override if isinstance(override, dict) else {}
+    override_model = str(override_cfg.get("model") or "").strip()
+    if override_model:
+        return override_model
+
     cfg = config if config is not None else _load_gateway_config()
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
@@ -777,6 +798,18 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _get_session_model_override(self, session_key: str | None) -> dict:
+        """Return a normalized per-session model override, if one is active."""
+        if not session_key:
+            return {}
+        overrides = getattr(self, "_session_model_overrides", None)
+        if not isinstance(overrides, dict):
+            return {}
+        override = overrides.get(session_key)
+        if not isinstance(override, dict):
+            return {}
+        return dict(override)
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -3507,6 +3540,7 @@ class GatewayRunner:
         current_base_url = ""
         current_api_key = ""
         user_provs = None
+        configured_aliases = None
         config_path = _hermes_home / "config.yaml"
         try:
             if config_path.exists():
@@ -3518,6 +3552,7 @@ class GatewayRunner:
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
+                configured_aliases = cfg.get("model_aliases")
         except Exception:
             pass
 
@@ -3530,6 +3565,29 @@ class GatewayRunner:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        direct_picker_models = []
+        if isinstance(configured_aliases, dict):
+            for alias_name, entry in configured_aliases.items():
+                if not isinstance(entry, dict):
+                    continue
+                alias_label = str(alias_name).strip()
+                model_value = str(entry.get("model") or alias_label).strip()
+                provider_value = str(entry.get("provider") or "").strip()
+                if not alias_label or not model_value:
+                    continue
+                is_current = model_value == current_model
+                if provider_value:
+                    is_current = is_current and provider_value == current_provider
+                direct_picker_models.append(
+                    {
+                        "input": alias_label,
+                        "label": alias_label,
+                        "model": model_value,
+                        "provider": provider_value,
+                        "is_current": is_current,
+                    }
+                )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -3633,6 +3691,7 @@ class GatewayRunner:
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
                         providers=providers,
+                        direct_models=direct_picker_models,
                         current_model=current_model,
                         current_provider=current_provider,
                         session_key=session_key,
@@ -3646,24 +3705,31 @@ class GatewayRunner:
             provider_label = get_label(current_provider)
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 
-            try:
-                providers = list_authenticated_providers(
-                    current_provider=current_provider,
-                    user_providers=user_provs,
-                    max_models=5,
-                )
-                for p in providers:
-                    tag = " (current)" if p["is_current"] else ""
-                    lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
-                    if p["models"]:
-                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
-                        extra = f" (+{p['total_models'] - len(p['models'])} more)" if p["total_models"] > len(p["models"]) else ""
-                        lines.append(f"  {model_strs}{extra}")
-                    elif p.get("api_url"):
-                        lines.append(f"  `{p['api_url']}`")
-                    lines.append("")
-            except Exception:
-                pass
+            if direct_picker_models:
+                lines.append("Curated models:")
+                for entry in direct_picker_models:
+                    tag = " (current)" if entry.get("is_current") else ""
+                    lines.append(f"`{entry['label']}`{tag}")
+                lines.append("")
+            else:
+                try:
+                    providers = list_authenticated_providers(
+                        current_provider=current_provider,
+                        user_providers=user_provs,
+                        max_models=5,
+                    )
+                    for p in providers:
+                        tag = " (current)" if p["is_current"] else ""
+                        lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
+                        if p["models"]:
+                            model_strs = ", ".join(f"`{m}`" for m in p["models"])
+                            extra = f" (+{p['total_models'] - len(p['models'])} more)" if p["total_models"] > len(p["models"]) else ""
+                            lines.append(f"  {model_strs}{extra}")
+                        elif p.get("api_url"):
+                            lines.append(f"  `{p['api_url']}`")
+                        lines.append("")
+                except Exception:
+                    pass
 
             lines.append("`/model <name>` — switch model")
             lines.append("`/model <name> --provider <slug>` — switch provider")
@@ -4518,9 +4584,11 @@ class GatewayRunner:
             return
 
         _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        session_key = self._session_key_for_source(source)
+        session_override = self._get_session_model_override(session_key)
 
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = _resolve_runtime_agent_kwargs(session_override)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -4530,7 +4598,7 @@ class GatewayRunner:
                 return
 
             user_config = _load_gateway_config()
-            model = _resolve_gateway_model(user_config)
+            model = _resolve_gateway_model(user_config, override=session_override)
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
@@ -4685,9 +4753,10 @@ class GatewayRunner:
             return
 
         _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+        session_override = self._get_session_model_override(session_key)
 
         try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs = _resolve_runtime_agent_kwargs(session_override)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
@@ -4697,7 +4766,7 @@ class GatewayRunner:
                 return
 
             user_config = _load_gateway_config()
-            model = _resolve_gateway_model(user_config)
+            model = _resolve_gateway_model(user_config, override=session_override)
             platform_key = _platform_config_key(source.platform)
             reasoning_config = self._load_reasoning_config()
             turn_route = self._resolve_turn_agent_config(question, model, runtime_kwargs)
@@ -4963,12 +5032,14 @@ class GatewayRunner:
             from run_agent import AIAgent
             from agent.model_metadata import estimate_messages_tokens_rough
 
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            session_key = self._session_key_for_source(source)
+            session_override = self._get_session_model_override(session_key)
+            runtime_kwargs = _resolve_runtime_agent_kwargs(session_override)
             if not runtime_kwargs.get("api_key"):
                 return "No provider configured -- cannot compress."
 
             # Resolve model from config (same reason as memory flush above).
-            model = _resolve_gateway_model()
+            model = _resolve_gateway_model(override=session_override)
 
             msgs = [
                 {"role": m.get("role"), "content": m.get("content")}
@@ -6579,10 +6650,11 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            model = _resolve_gateway_model(user_config)
+            session_override = self._get_session_model_override(session_key)
+            model = _resolve_gateway_model(user_config, override=session_override)
 
             try:
-                runtime_kwargs = _resolve_runtime_agent_kwargs()
+                runtime_kwargs = _resolve_runtime_agent_kwargs(session_override)
             except Exception as exc:
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
@@ -7187,7 +7259,8 @@ class GatewayRunner:
             # the actually-active model instead of the config default.
             _agent = agent_holder[0]
             if _agent is not None and hasattr(_agent, 'model'):
-                _cfg_model = _resolve_gateway_model()
+                _session_override = self._get_session_model_override(session_key)
+                _cfg_model = _resolve_gateway_model(override=_session_override)
                 if _agent.model != _cfg_model:
                     self._effective_model = _agent.model
                     self._effective_provider = getattr(_agent, 'provider', None)
