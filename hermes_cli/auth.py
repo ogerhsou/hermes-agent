@@ -21,6 +21,7 @@ import os
 import shutil
 import shlex
 import stat
+import re
 import base64
 import hashlib
 import subprocess
@@ -258,6 +259,58 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
     if api_key.startswith("sk-kimi-"):
         return KIMI_CODE_BASE_URL
     return default_url
+
+
+def _summarize_html_error_response(
+    raw_html: str,
+    *,
+    status_code: Optional[int] = None,
+    provider_label: str = "Codex",
+) -> Optional[Dict[str, str]]:
+    """Convert provider HTML error pages into stable codes + human messages."""
+    if not isinstance(raw_html, str):
+        return None
+
+    lowered = raw_html.strip().lower()
+    if "<!doctype" not in lowered and "<html" not in lowered:
+        return None
+
+    title_match = re.search(r"<title[^>]*>([^<]+)</title>", raw_html, re.IGNORECASE)
+    title = title_match.group(1).strip() if title_match else ""
+    title_lower = title.lower()
+    provider_prefix = provider_label.strip() or "Provider"
+
+    if "auth unavailable" in title_lower:
+        return {
+            "code": "codex_auth_unavailable",
+            "message": f"{provider_prefix} auth service temporarily unavailable (HTTP {status_code}).",
+        }
+
+    if any(
+        marker in lowered
+        for marker in ("cloudflare", "__cf_chl_rt_tk", "challenge-platform", "cf_chl_", "attention required!", "just a moment...")
+    ):
+        return {
+            "code": "codex_cloudflare_challenge",
+            "message": f"{provider_prefix} upstream returned a Cloudflare challenge page (HTTP {status_code}).",
+        }
+
+    if status_code and status_code >= 500:
+        return {
+            "code": "codex_service_unavailable",
+            "message": f"{provider_prefix} auth service temporarily unavailable (HTTP {status_code}).",
+        }
+
+    if title:
+        return {
+            "code": "html_error_page",
+            "message": f"{provider_prefix} returned an HTML error page: {title}.",
+        }
+
+    return {
+        "code": "html_error_page",
+        "message": f"{provider_prefix} returned an HTML error page.",
+    }
 
 
 def _gh_cli_candidates() -> list[str]:
@@ -1058,6 +1111,11 @@ def refresh_codex_oauth_pure(
         code = "codex_refresh_failed"
         message = f"Codex token refresh failed with status {response.status_code}."
         relogin_required = False
+        response_text = ""
+        try:
+            response_text = response.text or ""
+        except Exception:
+            response_text = ""
         try:
             err = response.json()
             if isinstance(err, dict):
@@ -1068,7 +1126,22 @@ def refresh_codex_oauth_pure(
                 if isinstance(err_desc, str) and err_desc.strip():
                     message = f"Codex token refresh failed: {err_desc.strip()}"
         except Exception:
-            pass
+            html_summary = _summarize_html_error_response(
+                response_text,
+                status_code=response.status_code,
+                provider_label="Codex",
+            )
+            if html_summary:
+                code = str(html_summary.get("code") or code)
+                message = str(html_summary.get("message") or message)
+        lower_message = message.lower()
+        if (
+            response.status_code == 503
+            and "auth unavailable" in lower_message
+            and code not in {"invalid_grant", "invalid_token", "invalid_request", "refresh_token_reused"}
+        ):
+            code = "codex_auth_unavailable"
+            message = "Codex auth service temporarily unavailable (HTTP 503)."
         if code in {"invalid_grant", "invalid_token", "invalid_request"}:
             relogin_required = True
         if code == "refresh_token_reused":

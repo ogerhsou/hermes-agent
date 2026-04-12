@@ -17,6 +17,7 @@ from hermes_cli.auth import (
     _import_codex_cli_tokens,
     get_codex_auth_status,
     get_provider_auth_state,
+    refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
     resolve_provider,
 )
@@ -126,6 +127,40 @@ def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert resolve_provider("openai-codex") == "openai-codex"
+
+
+def test_refresh_codex_oauth_pure_handles_auth_unavailable_html(monkeypatch):
+    class _FakeResponse:
+        status_code = 503
+        text = (
+            "<!DOCTYPE html><html><head><title>503 Auth Unavailable</title></head>"
+            "<body>temporarily unavailable</body></html>"
+        )
+
+        def json(self):
+            raise ValueError("not json")
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, *args, **kwargs):
+            return _FakeResponse()
+
+    monkeypatch.setattr("hermes_cli.auth.httpx.Client", _FakeClient)
+
+    with pytest.raises(AuthError) as exc:
+        refresh_codex_oauth_pure("access-token", "refresh-token", timeout_seconds=5)
+
+    assert exc.value.code == "codex_auth_unavailable"
+    assert exc.value.relogin_required is False
+    assert str(exc.value) == "Codex auth service temporarily unavailable (HTTP 503)."
 
 
 def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):

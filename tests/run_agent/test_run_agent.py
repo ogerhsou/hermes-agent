@@ -8,6 +8,7 @@ are made.
 import json
 import logging
 import re
+import time
 import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -837,6 +838,74 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["reasoning"]["effort"] == "medium"
 
+    def test_unsigned_tool_history_is_textified_for_direct_gemini(self, agent):
+        agent.provider = "gemini"
+        agent.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        messages = [
+            {"role": "user", "content": "please edit config"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"/tmp/config.yaml\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"content\":\"fallback_model: old\"}",
+            },
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+        api_messages = kwargs["messages"]
+
+        assert api_messages[1]["role"] == "assistant"
+        assert "tool_calls" not in api_messages[1]
+        assert "Gemini compatibility" in api_messages[1]["content"]
+        assert api_messages[2]["role"] == "assistant"
+        assert "Tool result from read_file" in api_messages[2]["content"]
+
+    def test_signed_tool_history_stays_structured_for_direct_gemini(self, agent):
+        agent.provider = "gemini"
+        agent.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        messages = [
+            {"role": "user", "content": "please edit config"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"/tmp/config.yaml\"}",
+                        },
+                        "extra_content": {"google": {"thought_signature": "sig-123"}},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "{\"content\":\"fallback_model: old\"}",
+            },
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+        api_messages = kwargs["messages"]
+
+        assert api_messages[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == "sig-123"
+        assert api_messages[2]["role"] == "tool"
+
     def test_reasoning_sent_for_nous_route(self, agent):
         agent.base_url = "https://inference-api.nousresearch.com/v1"
         agent.model = "minimax/minimax-m2.5"
@@ -1656,6 +1725,80 @@ class TestRunConversation:
         assert result["final_response"] == "(empty)"
         assert result["api_calls"] == 1  # no retries
 
+    def test_telegram_long_rate_limit_fails_fast_without_fallback(self, agent):
+        self._setup_agent(agent)
+        agent.platform = "telegram"
+
+        class _RateLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "code": "model_cooldown",
+                        "message": "All credentials for model coder-model are cooling down via provider qwen",
+                        "reset_seconds": 112,
+                        "reset_time": "1m52s",
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: All credentials for model coder-model are cooling down via provider qwen"
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_RateLimitError()),
+            patch.object(agent, "_try_activate_fallback", return_value=False),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_dump_api_request_debug"),
+            patch("run_agent.time.sleep", side_effect=AssertionError("sleep should not be called")),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "Retry after ~112s" in result["final_response"]
+
+    def test_telegram_long_rate_limit_switches_fallback_without_waiting(self, agent):
+        self._setup_agent(agent)
+        agent.platform = "telegram"
+        agent._fallback_chain = [("gemini", "gemini-3-flash-preview", None, None)]
+        agent._fallback_index = 0
+
+        class _RateLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "code": "model_cooldown",
+                        "message": "All credentials for model coder-model are cooling down via provider qwen",
+                        "reset_seconds": 112,
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: All credentials for model coder-model are cooling down via provider qwen"
+
+        resp = _mock_response(content="Done", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=[_RateLimitError(), resp]),
+            patch.object(agent, "_try_activate_fallback", return_value=True) as mock_fallback,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time.sleep", side_effect=AssertionError("sleep should not be called")),
+        ):
+            result = agent.run_conversation("hello")
+
+        mock_fallback.assert_called()
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
@@ -2172,6 +2315,115 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_extract_api_error_context_parses_retry_in_seconds_from_message(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "code": 429,
+                    "message": (
+                        "Quota exceeded for metric: foo. "
+                        "Please retry in 10.076070086s."
+                    ),
+                }
+            },
+            response=response,
+        )
+
+        started = time.time()
+        context = agent._extract_api_error_context(error)
+
+        assert 10.0 <= context["reset_at"] - started <= 10.2
+
+    def test_extract_api_error_context_uses_reset_seconds_from_payload(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "code": "model_cooldown",
+                    "message": "All credentials are cooling down.",
+                    "reset_seconds": 57,
+                }
+            },
+            response=response,
+        )
+
+        started = time.time()
+        context = agent._extract_api_error_context(error)
+
+        assert 56.0 <= context["reset_at"] - started <= 57.2
+
+    def test_extract_api_error_context_uses_reset_time_duration_from_payload(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "code": "model_cooldown",
+                    "message": "All credentials are cooling down.",
+                    "reset_time": "1m3s",
+                }
+            },
+            response=response,
+        )
+
+        started = time.time()
+        context = agent._extract_api_error_context(error)
+
+        assert 62.0 <= context["reset_at"] - started <= 63.2
+
+    def test_rate_limit_retry_after_uses_error_context_when_header_missing(self, agent):
+        error = SimpleNamespace(response=SimpleNamespace(headers={}))
+
+        wait_time = agent._rate_limit_retry_after_seconds(
+            error,
+            error_context={"reset_at": time.time() + 9.5},
+        )
+
+        assert 9.0 <= wait_time <= 9.6
+
+    def test_rate_limit_retry_after_header_overrides_error_context(self, agent):
+        error = SimpleNamespace(response=SimpleNamespace(headers={"retry-after": "12"}))
+
+        wait_time = agent._rate_limit_retry_after_seconds(
+            error,
+            error_context={"reset_at": time.time() + 3},
+        )
+
+        assert wait_time == 12.0
+
+    def test_summarize_api_error_classifies_codex_cloudflare_html(self, agent):
+        class _HtmlError(Exception):
+            status_code = 503
+
+            def __str__(self):
+                return (
+                    "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+                    "<body>https://chatgpt.com/backend-api/codex/chat/completions"
+                    "__cf_chl_rt_tk challenge-platform "
+                    "Cloudflare Ray ID: <strong>ray-123</strong></body></html>"
+                )
+
+        summary = agent._summarize_api_error(_HtmlError())
+
+        assert summary == "HTTP 503 — Codex upstream returned a Cloudflare challenge page — Ray ray-123"
+
+    def test_extract_api_error_context_classifies_codex_html_page(self, agent):
+        class _HtmlError(Exception):
+            status_code = 503
+            body = None
+            response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return (
+                    "<!DOCTYPE html><html><head><title>503 Auth Unavailable</title></head>"
+                    "<body>https://chatgpt.com/backend-api/codex/chat/completions</body></html>"
+                )
+
+        context = agent._extract_api_error_context(_HtmlError())
+
+        assert context["reason"] == "codex_auth_unavailable"
+        assert context["message"] == "HTTP 503 — Codex auth service temporarily unavailable"
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")

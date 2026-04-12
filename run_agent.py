@@ -1566,6 +1566,56 @@ class AIAgent:
         normalized.pop("thought_signature", None)
         return normalized
 
+    @classmethod
+    def _gemini_tool_call_has_thought_signature(cls, tool_call: Any) -> bool:
+        """Return True when a tool call carries Gemini's required thought signature."""
+        if not isinstance(tool_call, dict):
+            return False
+        extra = cls._normalize_gemini_tool_extra_content(tool_call.get("extra_content"))
+        if not isinstance(extra, dict):
+            return False
+        google_extra = extra.get("google")
+        signature = google_extra.get("thought_signature") if isinstance(google_extra, dict) else None
+        return isinstance(signature, str) and bool(signature.strip())
+
+    @staticmethod
+    def _message_content_to_text(content: Any) -> str:
+        """Best-effort plain-text rendering for provider-compatibility fallbacks."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, str):
+                    if item.strip():
+                        text_parts.append(item.strip())
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    text_parts.append(text_value.strip())
+            if text_parts:
+                return "\n".join(text_parts)
+        if isinstance(content, (dict, list)):
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except TypeError:
+                return str(content)
+        return str(content)
+
+    @staticmethod
+    def _truncate_provider_compatibility_text(text: str, limit: int = 2000) -> str:
+        """Keep compatibility summaries informative without exploding context size."""
+        if not isinstance(text, str):
+            text = str(text)
+        stripped = text.strip()
+        if len(stripped) <= limit:
+            return stripped
+        return stripped[:limit].rstrip() + "... [truncated]"
+
     def _normalize_gemini_tool_calls_for_api(self, api_messages: list) -> list:
         """Normalize Gemini tool call metadata without mutating stored history."""
         if not self._is_direct_gemini_openai_url():
@@ -1589,6 +1639,114 @@ class AIAgent:
                     normalized_messages = copy.deepcopy(api_messages)
                 normalized_messages[msg_idx]["tool_calls"][tc_idx]["extra_content"] = normalized_extra
         return normalized_messages or api_messages
+
+    def _prepare_gemini_messages_for_api(self, api_messages: list) -> list:
+        """Downgrade unsigned historical tool steps before sending mixed history to Gemini.
+
+        Gemini rejects functionCall parts that lack a thought_signature. That can
+        happen when a session started on a non-Gemini provider and later falls
+        back to Gemini mid-conversation. In that case we preserve the history by
+        converting the incompatible tool-call turns into plain assistant text.
+        """
+        if not self._is_direct_gemini_openai_url():
+            return api_messages
+
+        transformed = []
+        changed = False
+        idx = 0
+
+        while idx < len(api_messages):
+            msg = api_messages[idx]
+            if not isinstance(msg, dict):
+                transformed.append(msg)
+                idx += 1
+                continue
+
+            role = str(msg.get("role") or "")
+            tool_calls = msg.get("tool_calls")
+            if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+                unsigned_calls = [
+                    tc for tc in tool_calls
+                    if not self._gemini_tool_call_has_thought_signature(tc)
+                ]
+                if unsigned_calls:
+                    changed = True
+                    omitted_call_ids: set[str] = set()
+                    tool_name_by_id: Dict[str, str] = {}
+                    summary_lines = []
+
+                    original_text = self._message_content_to_text(msg.get("content"))
+                    if original_text:
+                        summary_lines.append(original_text)
+                    summary_lines.append(
+                        "[Previous tool-use step summarized for Gemini compatibility.]"
+                    )
+
+                    for tool_call in tool_calls:
+                        if not isinstance(tool_call, dict):
+                            continue
+                        function = tool_call.get("function")
+                        if not isinstance(function, dict):
+                            function = {}
+                        tool_name = str(function.get("name") or "tool")
+                        raw_args = self._message_content_to_text(function.get("arguments"))
+                        truncated_args = self._truncate_provider_compatibility_text(raw_args, limit=400)
+                        if truncated_args:
+                            summary_lines.append(
+                                f"Tool requested: {tool_name} with args {truncated_args}"
+                            )
+                        else:
+                            summary_lines.append(f"Tool requested: {tool_name}")
+
+                        call_id = tool_call.get("call_id") or tool_call.get("id")
+                        if isinstance(call_id, str) and call_id:
+                            omitted_call_ids.add(call_id)
+                            tool_name_by_id[call_id] = tool_name
+
+                    replacement = dict(msg)
+                    replacement.pop("tool_calls", None)
+                    replacement["content"] = "\n".join(
+                        line for line in summary_lines if line
+                    ).strip()
+                    transformed.append(replacement)
+                    idx += 1
+
+                    while idx < len(api_messages):
+                        next_msg = api_messages[idx]
+                        if not isinstance(next_msg, dict):
+                            transformed.append(next_msg)
+                            idx += 1
+                            continue
+                        if str(next_msg.get("role") or "") != "tool":
+                            break
+                        tool_call_id = next_msg.get("tool_call_id")
+                        if not isinstance(tool_call_id, str) or tool_call_id not in omitted_call_ids:
+                            transformed.append(next_msg)
+                            idx += 1
+                            continue
+
+                        tool_name = tool_name_by_id.get(tool_call_id, "tool")
+                        tool_text = self._message_content_to_text(next_msg.get("content"))
+                        tool_summary = self._truncate_provider_compatibility_text(
+                            tool_text or "[No tool output recorded.]",
+                            limit=2000,
+                        )
+                        transformed.append(
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    f"[Tool result from {tool_name} summarized for Gemini compatibility.]\n"
+                                    f"{tool_summary}"
+                                ).strip(),
+                            }
+                        )
+                        idx += 1
+                    continue
+
+            transformed.append(msg)
+            idx += 1
+
+        return transformed if changed else api_messages
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -2246,7 +2404,70 @@ class AIAgent:
         
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
         _save_trajectory_to_file(trajectory, self.model, completed)
-    
+
+    @staticmethod
+    def _classify_html_api_error(raw: str, *, status_code: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Classify HTML error pages into concise provider-aware summaries."""
+        import re as _re
+
+        if not isinstance(raw, str):
+            return None
+
+        stripped = raw.strip()
+        lowered = stripped.lower()
+        if "<!doctype" not in lowered and "<html" not in lowered:
+            return None
+
+        title_match = _re.search(r"<title[^>]*>([^<]+)</title>", stripped, _re.IGNORECASE)
+        title = title_match.group(1).strip() if title_match else ""
+
+        ray_match = _re.search(r"Cloudflare Ray ID:\s*<strong[^>]*>([^<]+)</strong>", stripped, _re.IGNORECASE)
+        ray_id = ray_match.group(1).strip() if ray_match else None
+
+        from_codex = "chatgpt.com/backend-api/codex" in lowered or "/backend-api/codex" in lowered
+        is_cloudflare_challenge = any(
+            marker in lowered
+            for marker in (
+                "cloudflare",
+                "__cf_chl_rt_tk",
+                "challenge-platform",
+                "cf_chl_",
+                "attention required!",
+                "just a moment...",
+            )
+        )
+        title_lower = title.lower()
+
+        if from_codex and "auth unavailable" in title_lower:
+            reason = "codex_auth_unavailable"
+            label = "Codex auth service temporarily unavailable"
+        elif from_codex and is_cloudflare_challenge:
+            reason = "codex_cloudflare_challenge"
+            label = "Codex upstream returned a Cloudflare challenge page"
+        elif is_cloudflare_challenge:
+            reason = "cloudflare_challenge"
+            label = "Upstream returned a Cloudflare challenge page"
+        elif from_codex and status_code == 503:
+            reason = "codex_service_unavailable"
+            label = "Codex service temporarily unavailable"
+        else:
+            reason = "html_error_page"
+            label = title or "HTML error page returned"
+
+        parts: List[str] = []
+        if status_code:
+            parts.append(f"HTTP {status_code}")
+        parts.append(label)
+        if ray_id:
+            parts.append(f"Ray {ray_id}")
+
+        return {
+            "summary": " — ".join(parts),
+            "reason": reason,
+            "title": title,
+            "ray_id": ray_id,
+        }
+
     @staticmethod
     def _summarize_api_error(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
@@ -2255,36 +2476,22 @@ class AIAgent:
         <title> tag instead of dumping raw HTML.  Falls back to a truncated
         str(error) for everything else.
         """
-        import re as _re
         raw = str(error)
+        status_code = getattr(error, "status_code", None)
 
-        # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
-        if "<!DOCTYPE" in raw or "<html" in raw:
-            m = _re.search(r"<title[^>]*>([^<]+)</title>", raw, _re.IGNORECASE)
-            title = m.group(1).strip() if m else "HTML error page (title not found)"
-            # Also grab Cloudflare Ray ID if present
-            ray = _re.search(r"Cloudflare Ray ID:\s*<strong[^>]*>([^<]+)</strong>", raw)
-            ray_id = ray.group(1).strip() if ray else None
-            status_code = getattr(error, "status_code", None)
-            parts = []
-            if status_code:
-                parts.append(f"HTTP {status_code}")
-            parts.append(title)
-            if ray_id:
-                parts.append(f"Ray {ray_id}")
-            return " — ".join(parts)
+        html_error = AIAgent._classify_html_api_error(raw, status_code=status_code)
+        if html_error:
+            return str(html_error.get("summary") or "HTML error page returned")
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
         if isinstance(body, dict):
             msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
             if msg:
-                status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 return f"{prefix}{msg[:300]}"
 
         # Fallback: truncate the raw string but give more room than 200 chars
-        status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
         return f"{prefix}{raw[:500]}"
 
@@ -2307,10 +2514,10 @@ class AIAgent:
         """
         if not error_msg:
             return "Unknown error"
-            
-        # Remove HTML content (common with CloudFlare and gateway error pages)
-        if error_msg.strip().startswith('<!DOCTYPE html') or '<html' in error_msg:
-            return "Service temporarily unavailable (HTML error page returned)"
+
+        html_error = AIAgent._classify_html_api_error(error_msg)
+        if html_error:
+            return str(html_error.get("summary") or "Service temporarily unavailable")
             
         # Remove newlines and excessive whitespace
         cleaned = ' '.join(error_msg.split())
@@ -2325,6 +2532,37 @@ class AIAgent:
     def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
         """Extract structured rate-limit details from provider errors."""
         context: Dict[str, Any] = {}
+
+        def _parse_relative_reset_seconds(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if not isinstance(value, str):
+                return None
+
+            raw = value.strip().lower()
+            if not raw:
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                pass
+
+            duration_match = re.fullmatch(
+                r"\s*(?:(\d+(?:\.\d+)?)\s*h)?\s*"
+                r"(?:(\d+(?:\.\d+)?)\s*m)?\s*"
+                r"(?:(\d+(?:\.\d+)?)\s*s)?\s*",
+                raw,
+            )
+            if not duration_match:
+                return None
+            hours, minutes, seconds = duration_match.groups()
+            if not any((hours, minutes, seconds)):
+                return None
+            return (
+                (float(hours) * 3600.0 if hours else 0.0)
+                + (float(minutes) * 60.0 if minutes else 0.0)
+                + (float(seconds) if seconds else 0.0)
+            )
 
         body = getattr(error, "body", None)
         payload = None
@@ -2348,6 +2586,16 @@ class AIAgent:
                     context["reset_at"] = time.time() + float(retry_after)
                 except (TypeError, ValueError):
                     pass
+            reset_seconds = payload.get("reset_seconds")
+            if reset_seconds not in (None, "") and "reset_at" not in context:
+                parsed_reset_seconds = _parse_relative_reset_seconds(reset_seconds)
+                if parsed_reset_seconds is not None:
+                    context["reset_at"] = time.time() + parsed_reset_seconds
+            reset_time = payload.get("reset_time")
+            if reset_time not in (None, "") and "reset_at" not in context:
+                parsed_reset_time = _parse_relative_reset_seconds(reset_time)
+                if parsed_reset_time is not None:
+                    context["reset_at"] = time.time() + parsed_reset_time
 
         response = getattr(error, "response", None)
         headers = getattr(response, "headers", None)
@@ -2362,10 +2610,17 @@ class AIAgent:
             if ratelimit_reset and "reset_at" not in context:
                 context["reset_at"] = ratelimit_reset
 
-        if "message" not in context:
-            raw_message = str(error).strip()
-            if raw_message:
-                context["message"] = raw_message[:500]
+        raw_message = str(error).strip()
+        html_error = AIAgent._classify_html_api_error(
+            raw_message,
+            status_code=getattr(error, "status_code", None),
+        )
+        if html_error:
+            context.setdefault("reason", html_error.get("reason"))
+            if "message" not in context:
+                context["message"] = str(html_error.get("summary") or "HTML error page returned")
+        elif "message" not in context and raw_message:
+            context["message"] = raw_message[:500]
 
         if "reset_at" not in context:
             message = context.get("message") or ""
@@ -2377,7 +2632,7 @@ class AIAgent:
                     context["reset_at"] = time.time() + seconds
                 else:
                     sec_match = re.search(
-                        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+                        r"retry\s+(?:(?:after|in)\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
                         message,
                         re.IGNORECASE,
                     )
@@ -2385,6 +2640,45 @@ class AIAgent:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
 
         return context
+
+    @staticmethod
+    def _rate_limit_retry_after_seconds(
+        api_error: Exception,
+        *,
+        error_context: Optional[Dict[str, Any]] = None,
+        cap_seconds: float = 120.0,
+    ) -> Optional[float]:
+        """Return retry delay for rate limits from headers or parsed error context."""
+        retry_after: Optional[float] = None
+
+        if isinstance(error_context, dict):
+            reset_at = error_context.get("reset_at")
+            reset_ts = None
+            if isinstance(reset_at, (int, float)):
+                reset_ts = float(reset_at)
+            elif isinstance(reset_at, str):
+                try:
+                    reset_ts = float(reset_at)
+                except (TypeError, ValueError):
+                    try:
+                        parsed = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                        reset_ts = parsed.timestamp()
+                    except (TypeError, ValueError):
+                        reset_ts = None
+            if reset_ts is not None:
+                retry_after = max(0.0, min(reset_ts - time.time(), cap_seconds))
+
+        response = getattr(api_error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers and hasattr(headers, "get"):
+            ra_raw = headers.get("retry-after") or headers.get("Retry-After")
+            if ra_raw:
+                try:
+                    retry_after = max(0.0, min(float(ra_raw), cap_seconds))
+                except (TypeError, ValueError):
+                    pass
+
+        return retry_after
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
@@ -5450,6 +5744,7 @@ class AIAgent:
                             tool_call.pop("response_item_id", None)
 
         sanitized_messages = self._normalize_gemini_tool_calls_for_api(sanitized_messages)
+        sanitized_messages = self._prepare_gemini_messages_for_api(sanitized_messages)
 
         # GPT-5 and Codex models respond better to 'developer' than 'system'
         # for instruction-following.  Swap the role at the API boundary so
@@ -8453,15 +8748,55 @@ class AIAgent:
                     # For rate limits, respect the Retry-After header if present
                     _retry_after = None
                     if is_rate_limited:
-                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                        if _resp_headers and hasattr(_resp_headers, "get"):
-                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                            if _ra_raw:
-                                try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
-                                except (TypeError, ValueError):
-                                    pass
+                        _retry_after = self._rate_limit_retry_after_seconds(
+                            api_error,
+                            error_context=error_context,
+                        )
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    _platform_name = str(getattr(self, "platform", "") or "").strip().lower()
+                    _is_messaging_platform = _platform_name in {
+                        "telegram", "discord", "whatsapp", "slack", "signal",
+                        "sms", "email", "dingtalk", "feishu", "wecom",
+                        "mattermost", "matrix", "homeassistant",
+                    }
+                    _long_messaging_cooldown = (
+                        is_rate_limited
+                        and _is_messaging_platform
+                        and _retry_after is not None
+                        and _retry_after >= 30.0
+                    )
+                    if _long_messaging_cooldown:
+                        cooldown_seconds = int(_retry_after)
+                        if _retry_after > cooldown_seconds:
+                            cooldown_seconds += 1
+                        if self._try_activate_fallback():
+                            self._emit_status(
+                                f"⏭️ Rate limit cooldown is ~{cooldown_seconds}s — switching to fallback instead of waiting..."
+                            )
+                            retry_count = 0
+                            continue
+                        _final_summary = self._summarize_api_error(api_error)
+                        self._emit_status(
+                            f"❌ Provider cooldown is ~{cooldown_seconds}s — please retry after it expires."
+                        )
+                        logger.warning(
+                            "Failing fast on long messaging-platform rate limit cooldown (%ss) %s error=%s",
+                            cooldown_seconds,
+                            self._client_log_context(),
+                            api_error,
+                        )
+                        self._dump_api_request_debug(
+                            api_kwargs, reason="long_rate_limit_cooldown", error=api_error,
+                        )
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": f"Provider rate-limited. Retry after ~{cooldown_seconds}s: {_final_summary}",
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _final_summary,
+                        }
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:
