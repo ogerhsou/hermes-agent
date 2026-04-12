@@ -918,6 +918,22 @@ class TestBuildAssistantMessage:
             "google": {"thought_signature": "abc123"}
         }
 
+    def test_tool_call_model_extra_preserved(self, agent):
+        """Non-streaming tool calls may expose extra_content via model_extra."""
+        tc = _mock_tool_call(
+            name="browser_navigate",
+            arguments='{"url":"https://example.com"}',
+            call_id="c2b",
+        )
+        tc.model_extra = {
+            "extra_content": {"google": {"thought_signature": "sig-model-extra"}}
+        }
+        msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        result = agent._build_assistant_message(msg, "tool_calls")
+        assert result["tool_calls"][0]["extra_content"] == {
+            "google": {"thought_signature": "sig-model-extra"}
+        }
+
     def test_tool_call_without_extra_content(self, agent):
         """Standard tool calls (no thinking model) should not have extra_content."""
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c3")

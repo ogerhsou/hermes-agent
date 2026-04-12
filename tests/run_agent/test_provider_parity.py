@@ -155,6 +155,43 @@ class TestBuildApiKwargsOpenRouter:
         assert anthropic_agent._should_sanitize_tool_calls() is True
 
 
+class TestBuildApiKwargsGemini:
+    def test_normalizes_flat_thought_signature_for_direct_gemini(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+        agent.model = "gemini-2.5-flash"
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                        "extra_content": {"thought_signature": "opaque"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+        tool_call = kwargs["messages"][1]["tool_calls"][0]
+
+        assert tool_call["extra_content"] == {
+            "google": {"thought_signature": "opaque"}
+        }
+        # Stored history must remain untouched so we don't mutate replay state.
+        assert messages[1]["tool_calls"][0]["extra_content"] == {
+            "thought_signature": "opaque"
+        }
+
+
 class TestDeveloperRoleSwap:
     """GPT-5 and Codex models should get 'developer' instead of 'system' role."""
 

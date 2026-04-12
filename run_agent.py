@@ -1530,9 +1530,65 @@ class AIAgent:
         url = (base_url or self._base_url_lower).lower()
         return "api.openai.com" in url and "openrouter" not in url
 
+    def _is_direct_gemini_openai_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets Gemini's OpenAI-compatible API."""
+        url = (base_url or self._base_url_lower).lower()
+        if "generativelanguage.googleapis.com" in url:
+            return True
+        return self.provider == "gemini" and "openrouter" not in url
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
+
+    @staticmethod
+    def _normalize_gemini_tool_extra_content(extra: Any) -> Any:
+        """Canonicalize Gemini thought signatures to Google's documented shape."""
+        if not isinstance(extra, dict):
+            return extra
+
+        google_extra = extra.get("google")
+        if isinstance(google_extra, dict) and google_extra.get("thought_signature"):
+            return extra
+
+        thought_signature = extra.get("thought_signature")
+        if not isinstance(thought_signature, str) or not thought_signature.strip():
+            return extra
+
+        normalized = dict(extra)
+        google_block = normalized.get("google")
+        if isinstance(google_block, dict):
+            google_block = dict(google_block)
+        else:
+            google_block = {}
+        google_block.setdefault("thought_signature", thought_signature)
+        normalized["google"] = google_block
+        normalized.pop("thought_signature", None)
+        return normalized
+
+    def _normalize_gemini_tool_calls_for_api(self, api_messages: list) -> list:
+        """Normalize Gemini tool call metadata without mutating stored history."""
+        if not self._is_direct_gemini_openai_url():
+            return api_messages
+
+        normalized_messages = None
+        for msg_idx, msg in enumerate(api_messages):
+            if not isinstance(msg, dict):
+                continue
+            tool_calls = msg.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tc_idx, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                extra = tool_call.get("extra_content")
+                normalized_extra = self._normalize_gemini_tool_extra_content(extra)
+                if normalized_extra is extra:
+                    continue
+                if normalized_messages is None:
+                    normalized_messages = copy.deepcopy(api_messages)
+                normalized_messages[msg_idx]["tool_calls"][tc_idx]["extra_content"] = normalized_extra
+        return normalized_messages or api_messages
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -5393,6 +5449,8 @@ class AIAgent:
                             tool_call.pop("call_id", None)
                             tool_call.pop("response_item_id", None)
 
+        sanitized_messages = self._normalize_gemini_tool_calls_for_api(sanitized_messages)
+
         # GPT-5 and Codex models respond better to 'developer' than 'system'
         # for instruction-following.  Swap the role at the API boundary so
         # internal message representation stays uniform ("system").
@@ -5680,9 +5738,12 @@ class AIAgent:
                 # is sent back on subsequent API calls.  Without this, Gemini 3
                 # thinking models reject the request with a 400 error.
                 extra = getattr(tool_call, "extra_content", None)
+                if extra is None and hasattr(tool_call, "model_extra"):
+                    extra = (tool_call.model_extra or {}).get("extra_content")
                 if extra is not None:
                     if hasattr(extra, "model_dump"):
                         extra = extra.model_dump()
+                    extra = self._normalize_gemini_tool_extra_content(extra)
                     tc_dict["extra_content"] = extra
                 tool_calls.append(tc_dict)
             msg["tool_calls"] = tool_calls
