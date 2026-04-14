@@ -1580,8 +1580,9 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     from tools.browser_camofox import _get_session, _ensure_tab, _post
     try:
         session = _get_session(task_id or "default")
-        tab_id = _ensure_tab(session)
-        resp = _post(f"/tabs/{tab_id}/eval", json_data={"expression": expression})
+        _ensure_tab(task_id or "default")
+        tab_id = session["tab_id"]
+        resp = _post(f"/tabs/{tab_id}/evaluate", json_data={"expression": expression})
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp

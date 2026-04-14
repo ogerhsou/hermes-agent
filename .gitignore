@@ -58,3 +58,8 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+
+# Crawl cached/temporary files in root
+/*.html
+/smzdm_history.json
+/smzdm_rss.xml
