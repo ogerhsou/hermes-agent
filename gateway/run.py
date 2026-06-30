@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List
 
 # ---------------------------------------------------------------------------
@@ -1938,6 +1938,9 @@ class GatewayRunner:
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+            if _cmd_def_inner and _cmd_def_inner.name == "agyusage":
+                return await self._handle_agyusage_command(event)
+
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
             # is truly hung — the executor thread is blocked and never checks
@@ -2141,6 +2144,9 @@ class GatewayRunner:
 
         if canonical == "usage":
             return await self._handle_usage_command(event)
+
+        if canonical == "agyusage":
+            return await self._handle_agyusage_command(event)
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
@@ -5304,6 +5310,256 @@ class GatewayRunner:
             f"Branch: `{new_session_id}`\n"
             f"Use `/resume` to switch back to the original."
         )
+
+    async def _handle_agyusage_command(self, event: MessageEvent) -> str:
+        """Handle /agyusage command -- show Antigravity quota via the local agy shim."""
+        import urllib.parse
+        import urllib.request
+
+        def _fmt_percent(value: Any) -> str:
+            try:
+                n = float(value or 0.0)
+            except (TypeError, ValueError):
+                n = 0.0
+            return f"{n:.2f}%"
+
+        def _fmt_remaining(value: Any) -> str:
+            try:
+                n = float(value or 0.0)
+            except (TypeError, ValueError):
+                n = 0.0
+            return f"{round(n):.0f}%"
+
+        def _fmt_tokens(value: Any) -> str:
+            try:
+                n = int(value or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n >= 1_000_000:
+                return f"{n / 1_000_000:.2f}M"
+            if n >= 10_000:
+                return f"{n / 1_000:.0f}K"
+            if n >= 1_000:
+                return f"{n / 1_000:.1f}K"
+            return f"{n:,}"
+
+        def _short_dt(value: Any) -> str:
+            if not value:
+                return "unknown"
+            text = str(value)
+            try:
+                dt = datetime.fromisoformat(text)
+                return dt.strftime("%m-%d %H:%M")
+            except Exception:
+                return text.replace("T", " ")[:16]
+
+        def _time_until(value: Any) -> str:
+            if not value:
+                return "unknown"
+            text = str(value)
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                now = datetime.now(dt.tzinfo or timezone.utc)
+                seconds = max(0, int((dt - now).total_seconds()))
+                hours = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                return f"{hours}h {minutes:02d}m"
+            except Exception:
+                return "unknown"
+
+        def _bar(remaining_percent: Any, width: int = 20) -> str:
+            try:
+                pct = max(0.0, min(100.0, float(remaining_percent or 0.0)))
+            except (TypeError, ValueError):
+                pct = 0.0
+            filled = round(width * pct / 100)
+            return "[" + "#" * filled + "." * (width - filled) + "]"
+
+        def _int_or_none(value: Any) -> int | None:
+            try:
+                if value is None or value == "":
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _agy_endpoint_from_base(base_url: str, suffix: str) -> str:
+            base = (base_url or "http://127.0.0.1:8320/v1").rstrip("/")
+            if base.endswith("/v1"):
+                return f"{base}/agy/{suffix}"
+            return f"{base}/v1/agy/{suffix}"
+
+        def _fetch_json(url: str) -> dict:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        raw_args = event.get_command_args().strip().lower()
+        parts = raw_args.split()
+        cfg = _load_gateway_config()
+        usage_cfg = cfg.get("agy_usage", {}) if isinstance(cfg.get("agy_usage"), dict) else {}
+
+        base_url = ""
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict) and str(model_cfg.get("provider", "")).endswith(":agy"):
+            base_url = str(model_cfg.get("base_url") or "")
+        if not base_url:
+            for provider_cfg in cfg.get("custom_providers", []) or []:
+                if isinstance(provider_cfg, dict) and provider_cfg.get("name") == "agy":
+                    base_url = str(provider_cfg.get("base_url") or "")
+                    break
+
+        timezone_name = (
+            str(usage_cfg.get("timezone") or "").strip()
+            or str(cfg.get("timezone") or "").strip()
+            or os.getenv("HERMES_TIMEZONE", "").strip()
+        )
+
+        async def _render_local_usage(period_arg: str = "today") -> str:
+            period_aliases = {
+                "day": "today",
+                "24h": "today",
+                "week": "7d",
+                "month": "30d",
+            }
+            period = period_aliases.get(period_arg, period_arg)
+            if period not in {"today", "yesterday", "7d", "30d", "all"}:
+                return "Usage: `/agyusage` or `/agyusage local [today|yesterday|7d|30d|all]`"
+
+            endpoint = str(usage_cfg.get("endpoint") or "").strip() or _agy_endpoint_from_base(base_url, "usage")
+            query = {"period": period}
+            if timezone_name:
+                query["tz"] = timezone_name
+            url = f"{endpoint}?{urllib.parse.urlencode(query)}"
+
+            try:
+                data = await asyncio.to_thread(_fetch_json, url)
+            except Exception as exc:
+                return f"Agy local usage is not available yet.\nCould not reach `{endpoint}`: {exc}"
+
+            models = data.get("models") or []
+            window = data.get("window") or {}
+            totals = data.get("totals") or {}
+            quotas = usage_cfg.get("daily_token_quotas") or usage_cfg.get("daily_quotas") or {}
+            if not isinstance(quotas, dict):
+                quotas = {}
+
+            lines = [
+                f"**Agy Local Usage** ({data.get('label') or period})",
+                f"Local reset: `{_short_dt(window.get('next_daily_reset'))}`"
+                + (f" ({timezone_name})" if timezone_name else ""),
+                f"Total: {_fmt_tokens(totals.get('total_tokens'))} est. tokens"
+                f" across {int(totals.get('calls') or 0)} call(s)",
+            ]
+
+            if not models:
+                lines.append("\nNo agy shim usage recorded yet.")
+                lines.append("New Telegram/Hermes calls through agy will appear here.")
+                return "\n".join(lines)
+
+            lines.append("")
+            for item in models:
+                model = item.get("model") or "unknown"
+                calls = int(item.get("calls") or 0)
+                errors = int(item.get("errors") or 0)
+                tokens = int(item.get("total_tokens") or 0)
+                quota = _int_or_none(quotas.get(model))
+                extra = ""
+                if quota and period == "today":
+                    remaining = max(0, quota - tokens)
+                    pct = min(100.0, (tokens / quota) * 100) if quota > 0 else 0.0
+                    extra = f", remaining ~{_fmt_tokens(remaining)} ({pct:.0f}% used)"
+                elif period == "today":
+                    extra = ", remaining unknown"
+                error_part = f", {errors} error(s)" if errors else ""
+                lines.append(
+                    f"- `{model}`: {_fmt_tokens(tokens)} est. tokens, "
+                    f"{calls} call(s){error_part}{extra}"
+                )
+
+            latest = data.get("latest")
+            if isinstance(latest, dict):
+                lines.append(
+                    f"\nLast call: `{latest.get('model_id')}` at "
+                    f"`{_short_dt(latest.get('created_at'))}`"
+                )
+
+            last_error = data.get("last_error")
+            if isinstance(last_error, dict) and last_error.get("error"):
+                err = str(last_error.get("error") or "").replace("\n", " ").strip()
+                if len(err) > 180:
+                    err = err[:177] + "..."
+                lines.append(f"Last error: `{last_error.get('model_id')}` - {err}")
+
+            if period == "today" and not quotas:
+                lines.append("\nProvider remaining is unknown; set `agy_usage.daily_token_quotas` to show an estimate.")
+            lines.append("_Token counts are local rough estimates from the agy shim._")
+            return "\n".join(lines)
+
+        if parts and parts[0] == "local":
+            return await _render_local_usage(parts[1] if len(parts) > 1 else "today")
+
+        if parts and parts[0] not in {"quota", "real"}:
+            return "Usage: `/agyusage` or `/agyusage local [today|yesterday|7d|30d|all]`"
+
+        endpoint = str(usage_cfg.get("quota_endpoint") or "").strip() or _agy_endpoint_from_base(base_url, "quota")
+        try:
+            data = await asyncio.to_thread(_fetch_json, endpoint)
+        except Exception as exc:
+            local = await _render_local_usage("today")
+            return (
+                "Agy quota is not available from Antigravity right now.\n"
+                f"Could not reach `{endpoint}`: {exc}\n\n"
+                f"{local}"
+            )
+
+        if not data.get("ok"):
+            local = await _render_local_usage("today")
+            return (
+                "Agy quota is not available from Antigravity right now.\n"
+                f"{data.get('error') or 'Unknown quota error'}\n\n"
+                f"{local}"
+            )
+
+        account = data.get("account") if isinstance(data.get("account"), dict) else {}
+        account_bits = []
+        if account.get("email"):
+            account_bits.append(f"`{account.get('email')}`")
+        if account.get("plan"):
+            account_bits.append(str(account.get("plan")))
+
+        lines = ["**Agy Models & Quota**"]
+        if account_bits:
+            lines.append("Account: " + " - ".join(account_bits))
+
+        groups = data.get("groups") or []
+        if not groups:
+            lines.append("No quota groups returned by Antigravity.")
+            return "\n".join(lines)
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            title = str(group.get("display_name") or "Model Group").upper()
+            lines.append(f"\n**{title}**")
+            if group.get("description"):
+                lines.append(str(group.get("description")))
+            for bucket in group.get("buckets") or []:
+                if not isinstance(bucket, dict):
+                    continue
+                name = bucket.get("display_name") or bucket.get("window") or "Limit"
+                remaining = float(bucket.get("remaining_percent") or 0.0)
+                reset_time = bucket.get("reset_time")
+                lines.append(
+                    f"{name}: `{_bar(remaining)} {_fmt_percent(remaining)}`"
+                )
+                lines.append(
+                    f"{_fmt_remaining(remaining)} remaining - Refreshes in {_time_until(reset_time)}"
+                )
+
+        source = data.get("source") if isinstance(data.get("source"), dict) else {}
+        if source.get("port"):
+            lines.append(f"\nSource: Antigravity local server `:{source.get('port')}`")
+        return "\n".join(lines)
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the session's last agent run."""

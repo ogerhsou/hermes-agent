@@ -130,6 +130,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[page]"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("usage", "Show token usage for the current session", "Info"),
+    CommandDef("agyusage", "Show Antigravity model quota from agy", "Info",
+               aliases=("agy-usage",), args_hint="[local [today|yesterday|7d|30d|all]]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
